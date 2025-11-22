@@ -30,6 +30,7 @@ calcVal = 0
 // Stores the last brightness value to feed back into the PI gain controller 
 export var lastVal = .25
 var maxSensitivity = 2500
+var minSensitivity = 5  // Minimum output to ensure some visible light
 var brightness = .5
 
 // Monitoring variables to determine appropriate maxSensitivity and starting sensitivity
@@ -95,7 +96,7 @@ function calcPIController(pic, err) {
   pic[2] = clamp(pic[2] + err, pic[3], pic[4])
   gainProportional = pic[0] * err
   gainIntegral = pic[1] * pic[2]
-  return clamp(gainProportional + gainIntegral, pic[3], pic[4])
+  return clamp(gainProportional + gainIntegral, minSensitivity, pic[4])
 }
 
 export function beforeRender(delta) {
