@@ -1,4 +1,3 @@
-
 /*
   Sound - rays
 
@@ -10,32 +9,12 @@
   rays of color will then travel down the strip.
 
   Please check out the "sound - blink fade" pattern for more verbose comments
-  explaining the PI controller used below for automatic gain control.
+  explaining the PI controller used below for automatic gain control. 
 */
 
-// ============================================================================
-// CONFIGURATION - LED Strip Layout (574 pixels total)
-// ============================================================================
-// Wall segments: lights flow from corners toward the center of each wall
-// Wall 1: 188 pixels (indices 0-187)   - split at pixel 94
-// Wall 2: 198 pixels (indices 188-385) - split at pixel 287
-// Wall 3: 188 pixels (indices 386-573) - split at pixel 480
 
-var WALL_1_SIZE = 188  // First wall pixel count
-var WALL_2_SIZE = 198  // Second wall pixel count
-var WALL_3_SIZE = 188  // Third wall pixel count
-
-var WALL_1_START = 0
-var WALL_1_CENTER = WALL_1_START + floor(WALL_1_SIZE / 2)  // 94
-
-var WALL_2_START = WALL_1_START + WALL_1_SIZE  // 188
-var WALL_2_CENTER = WALL_2_START + floor(WALL_2_SIZE / 2)  // 287
-
-var WALL_3_START = WALL_2_START + WALL_2_SIZE  // 386
-var WALL_3_CENTER = WALL_3_START + floor(WALL_3_SIZE / 2)  // 480
-
-// Speed that the rays travel down the strip (pixels per millisecond)
-export var speed = 38.3/1000
+// Speed that the rays travel down the strip
+export var speed = 38.3/1000 // pixelCount / numberOfSeconds to traverse entire strip / 1000 milliseconds
 
 // These vars are set by the external sensor board, if one is connected. We
 // don't actually use light readings in this pattern, so if the `light` value
@@ -50,78 +29,37 @@ pos = 0
 calcVal = 0
 // Stores the last brightness value to feed back into the PI gain controller 
 export var lastVal = .25
-var lumensity = 32767 / 2
-export var pixensity = .5
+var maxSensitivity = 2500
+var brightness = .5
+
+// Monitoring variables to determine appropriate maxSensitivity and starting sensitivity
+export var minMFM = 1, maxMFM = 0  // Observed range of maxFrequencyMagnitude
+export var minSens = 9999, maxSens = 0  // Observed range of sensitivity
 
 hues = array(pixelCount)
 vals = array(pixelCount)
-writ = array(pixelCount)  // Flow direction mapping array
+writ = array(pixelCount)
 var rotateColors = false
 timer = 0
 waitTime = 1000
 undershoot = overshoot = dsensitivity = 0
 
-// ============================================================================
-// Initialize flow direction mapping
-// ============================================================================
-// Each wall is split in half. Lights flow from both corners to the center.
-// First half of each wall: normal flow (corner → center)
-// Second half of each wall: reverse flow (corner → center)
-
-for (i = 0; i < pixelCount; i++) {
-  // Wall 1 - First half (0 to 93): Flow forward from corner 1 to center
-  if (i < WALL_1_CENTER) {
-    writ[i] = i
+for (i=0;i<pixelCount;i++) {
+  // First establish normal flow
+  if (i < 94 || (i >= 188 && i < 287) || (i >= 386 && i < 480) ) {
+    writ[i] = i;
+  // then establish opposite
+  // second corner
   }
-  // Wall 1 - Second half (94 to 187): Flow backward from corner 2 to center
-  else if (i < WALL_2_START) {
-    writ[i] = WALL_2_START - 1 - i + WALL_1_CENTER
+  else if (i < 188) {
+    writ[i] = 188 - i + 93
   }
-  // Wall 2 - First half (188 to 286): Flow forward from corner 2 to center
-  else if (i < WALL_2_CENTER) {
-    writ[i] = i
+  else if (i < 386) {
+    writ[i] = 386  - i + 286
   }
-  // Wall 2 - Second half (287 to 385): Flow backward from corner 3 to center
-  else if (i < WALL_3_START) {
-    writ[i] = WALL_3_START - 1 - i + WALL_2_CENTER
-  }
-  // Wall 3 - First half (386 to 479): Flow forward from corner 3 to center
-  else if (i < WALL_3_CENTER) {
-    writ[i] = i
-  }
-  // Wall 3 - Second half (480 to 573): Flow backward from corner 4 to center
   else {
-    writ[i] = pixelCount - 1 - i + WALL_3_CENTER
+    writ[i] = pixelCount - i + 479
   }
-}
-
-function roundEven(num) {
-  return round(num/2)*2
-}
-
-export var sliderNumerity = function(val) {
-  pixensity = roundEven((0.001 + (.999-.001)*val)*100)/100
-  opposed = .5 + (2-.5)*val
-  target = pow(pixensity/2, opposed)
-  lumensity = pic[4] = 500 + (pow(2, 13)-500)*pixensity
-}
-
-export function showNumberN() {
-  return pixensity
-}
-
-export var sliderProportional = function(val) {
-  pic[0] = roundEven(val*100)/100
-}
-export var showNumberP = function() {
-  return pic[0]
-}
-
-export function sliderIntegral(val) {
-  pic[1] = roundEven(val*100)/100
-}
-export function showNumberI() {
-  return pic[1]
 }
 
 export var togglerotateColors = function(bool) {
@@ -139,113 +77,100 @@ export function showNumberSensitivity() {
   return dsensitivity
 }
 
-// ============================================================================
-// PI Controller for automatic gain control
-// ============================================================================
-// The PI (Proportional-Integral) controller automatically adjusts sensitivity
-// to maintain consistent brightness despite varying audio levels.
-// pic[0] = kp (proportional gain), pic[1] = ki (integral gain)
-// pic[2] = integral accumulator, pic[3] = min, pic[4] = max
-var pic = makePIController(0.055, .355, 2048, 0, lumensity)
+var pic = makePIController(0.05, .35, 30, 0, maxSensitivity)
 
-// Create a new PI Controller with specified parameters
+// Make a new PI Controller
 function makePIController(kp, ki, start, min, max) {
   pic = array(5)
-  pic[0] = kp  // Proportional gain
-  pic[1] = ki  // Integral gain
-  pic[2] = start  // Initial integral value
-  pic[3] = min  // Minimum output value
-  pic[4] = max  // Maximum output value
+  pic[0] = kp
+  pic[1] = ki
+  pic[2] = start
+  pic[3] = min
+  pic[4] = max
   return pic
 }
 export var gainProportional, gainIntegral, errorPrev, calcmean, calcVal;
-
-// Calculate PI controller output with derivative component
 function calcPIController(pic, err) {
-  // Update integral term with clamping to prevent windup
+  // proportional = err; integral = err + integral
   pic[2] = clamp(pic[2] + err, pic[3], pic[4])
-
-  // Calculate each component of the PID-like controller
-  diff = errorPrev - err
-  gainProportional = pic[0] * err  // Proportional: immediate response to error
-  gainIntegral = pic[1] * pic[2]  // Integral: accumulated error over time
-  gainDiff = diff * .125  // Derivative: rate of change dampening
-  errorPrev = err
-
-  // Combine all gains and clamp the output
-  return clamp(gainProportional + gainIntegral + gainDiff, .5, 900)
+  gainProportional = pic[0] * err
+  gainIntegral = pic[1] * pic[2]
+  return clamp(gainProportional + gainIntegral, pic[3], pic[4])
 }
 
-// ============================================================================
-// beforeRender - Called once per frame before rendering pixels
-// ============================================================================
 export function beforeRender(delta) {
-  // Use the last calculated brightness value as feedback for the PI controller
-  // The PI controller aims to keep brightness around pixensity (default 0.5)
-  calcVal = lastVal
-  sensitivity = calcPIController(pic, pixensity - calcVal)  // error = setpoint - measuredValue
+  // Here the PI controller is aiming for a sensitivity based on chasing recent
+  // maxFrequencyMagnitudes to be 0.5
+  // calcmean = vals.sum() / pixelCount
+  calcVal = lastVal // calcmean
+  // calcVal = (vals[0] + vals[pixelCount/4] + vals[pixelCount/2] + vals[pixelCount-1] + lastVal)/5
+  sensitivity = calcPIController(pic, brightness - calcVal)// error = setpoint - measuredValue
 
-  // Advance the position pointer to make rays travel down the strip
-  // This creates a circular buffer effect in the hues[] and vals[] arrays
+  // To make the rays travel along the strip, sweep a position offset pointer
+  // down the arrays of values and hues
   pos = (pos + speed * delta) % pixelCount
-
-  // Use simulated sound if no sensor board is connected
-  if (light == -1) simulateSound()
-
-  // Calculate brightness from audio magnitude and store it at current position
-  // The brightness is our feedback signal to the PI controller
+  if (light == -1) simulateSound()  // No sensor board attached
+  
+  // The brightness value will be determined by the magnitude of the most
+  // intense frequency. This is also our feedback to the PI controller.
   lastVal = pow(maxFrequencyMagnitude * sensitivity, 2)
   vals[pos] = lastVal
+  
+  // Track observed ranges for tuning
+  if (maxFrequencyMagnitude > 0 && maxFrequencyMagnitude < minMFM) minMFM = maxFrequencyMagnitude
+  if (maxFrequencyMagnitude > maxMFM) maxMFM = maxFrequencyMagnitude
+  if (sensitivity < minSens) minSens = sensitivity
+  if (sensitivity > maxSens) maxSens = sensitivity
 
-  // Update UI gauges periodically
   timer += delta
   if (timer > waitTime) {
     timer -= waitTime
-    undershoot = pixensity - calcVal
-    overshoot = calcVal - pixensity
+    undershoot = brightness - calcVal
+    overshoot = calcVal - brightness
     dsensitivity = sensitivity
   }
 
-  // Map audio frequency to hue (0-5000 Hz maps to full color wheel)
-  // Lower frequencies = red/orange, higher frequencies = blue/purple
+  /*
+    The base color will be modified by time and strip position in render(), but
+    its hue begins based on the most intense frequency detected. If you played a
+    swept tone between 20 Hz and 5 KHz, it'd trace a rainbow. 
+  */
   hues[pos] = maxFrequency / 5000
 
-  // Time variable for gradual hue rotation
-  t1 = time(12 / 65.536)
+  // Used to subtly advance the hue over time
+  t1 = time(12 / 65.536) // 65.536
 }
 
-// Helper function to map physical pixel index to circular buffer position
 function newPosition(x) {
+  // y = pixelCount - x
+  // z = y + pos
+  // return z % pixelCount
   return ((pixelCount - x) + pos) % pixelCount
 }
 
-// ============================================================================
-// render - Called for each pixel to set its color
-// ============================================================================
 export function render(index) {
-  // Apply flow direction mapping, then map to circular buffer position
-  // This makes rays travel from corners to centers of each wall
-  index = newPosition(writ[index % pixelCount])
-
-  // Get the hue for this pixel from the circular buffer
+  // Shift the index circularly based on the position offset
+  // if (index <= 93 || index > 188 && index < 286 || index > 378 && index < 479) {
+  index = newPosition(writ[(index % pixelCount) % pixelCount])
+  
   h = hues[index]
-
-  // Optional: Add gradual color rotation over time and position
-  // This creates a rainbow gradient effect that slowly moves
-  // Toggle with the "rotateColors" UI control
+  /*
+    This rotates color by adding a component based on time and position.  
+    Comment this out to more clearly see the detected maximum frequencies.
+    Adding `index / pixelCount / 4` adds a quarter of the hue wheel across the
+    strip's entire length. Notice that since index is reversed, *adding* t1 back
+    in has the effect of *slowing* the hue progression.
+  */
   h += rotateColors ? index / pixelCount / 4 + t1 : h
 
-  // Get brightness value and apply gamma correction for smoother dimming
   v = vals[index]
   vsq = v * v  // Gamma correction
-
-  // Set the pixel color (full saturation, variable brightness)
   hsv(h, 1, vsq)
 }
 
-// Simulate sound data when no sensor board is connected
-// Generates random frequency values for testing the pattern
 function simulateSound() {
+  
   maxFrequency += random(5000)
   maxFrequencyMagnitude = .5
+  
 }
