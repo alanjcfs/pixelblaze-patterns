@@ -1,5 +1,271 @@
 # Cochlear Implant LED Pattern - Design Document
 
+## Implementation Status
+
+**🔄 REDESIGNING**: Updated design with **rainbow gradient base** and **proportional brightness**.
+
+**Key Changes from Previous Design**:
+- **Fixed rainbow hues** per electrode (red=low freq, blue=high freq) - no color rotation
+- **Brightness proportional** to `frequencyData / maxFrequencyMagnitude`, squared
+- **maxFrequency segment turns white**, fades back to rainbow color over 3 seconds
+- **Other segments brighten in their own color** (no white flash)
+- **Minimum brightness** ensures rainbow gradient always visible
+- **AGC aligned with audio-lights.js** (no gainDiff term)
+
+**📋 REFERENCE**: The sections following the implementation describe the original continuous spectrogram design concept (574 individual pixels). This was replaced with the segmented design during development.
+
+---
+
+## Actual Implementation (22-Electrode Segments)
+
+### Overview
+
+The implemented pattern simulates a 22-electrode cochlear implant by dividing the 574-pixel LED strip into 22 segments (~26 pixels each). Each segment represents one frequency band (electrode), with **amplitude controlling spatial size** within the segment.
+
+### Key Architectural Differences from Original Design
+
+| Aspect | Original Design | Actual Implementation |
+|--------|----------------|----------------------|
+| **Structure** | 574 individual pixels | 22 segments of ~26 pixels |
+| **State Arrays** | Per-pixel (574 values each) | Per-segment (22 values each) |
+| **Amplitude Effect** | Controls brightness only | **Controls spatial size** (quiet=center, loud=full segment) |
+| **Decay** | Each pixel independent | All pixels in segment synchronized |
+| **Frequency Mapping** | Continuous spectrogram | 22 logarithmic frequency bands (200-8000 Hz) |
+
+### Core Behavior
+
+**Rainbow Gradient Base**:
+- Each electrode has a **fixed hue** based on its frequency position
+- Electrode 0 (low freq, 200 Hz) = Red (hue 0.0)
+- Electrode 21 (high freq, 8000 Hz) = Blue (hue 0.67)
+- **Minimum brightness**: All pixels always show a dim rainbow gradient, even in silence
+
+**Brightness Calculation (Proportional to Max)**:
+- Brightness is calculated relative to `maxFrequencyMagnitude`
+- `relativeMagnitude = frequencyData[bin] / maxFrequencyMagnitude`
+- `segmentValues[electrode] = pow(relativeMagnitude, 2)`
+- Example: frequencyData [0.4, 0.1, 0.7] → brightness [0.33, 0.02, 1.0]
+- Sensitivity is applied for threshold/AGC, but cancels out in the ratio
+
+**Two Types of Segment Behavior**:
+
+1. **maxFrequency Segment (White Flash)**:
+   - The segment closest to `maxFrequency` turns **white** (saturation = 0)
+   - Brightness = 1.0 (always the max)
+   - Decays: saturation 0 → 1 over 3 seconds (white → rainbow color)
+
+2. **Other Active Segments (Colored Brightness)**:
+   - Brighten in their **own rainbow color** (saturation = 1.0)
+   - Brightness proportional to their magnitude relative to max
+   - Decay back to minimum brightness
+
+**Amplitude-Based Spatial Growth**:
+- Amplitude controls how many pixels light up within a segment
+- **Quiet sound**: Only center pixel lights up
+- **Loud sound**: Entire segment lights up
+- Amplitude decays quickly (segment shrinks)
+
+**Synchronized Segment Decay** (3 seconds):
+- All pixels within a segment share the same HSV state
+- **Hue**: Fixed per electrode (no rotation) - maintains rainbow position
+- **Saturation**: Only maxFrequency segment desaturates; others stay at 1.0
+- **Value**: Triggered brightness → minimum brightness with exponential fade
+- **Amplitude**: Segment shrinks quickly (fully shrunk at 30% of decay time)
+
+**Visual Effect**:
+- **Silence**: Dim rainbow gradient always visible
+- **Sound**: maxFrequency segment flashes white; other active segments brighten in their rainbow colors
+- **Frequency visualization**: See which parts of the rainbow are active (red = low freq, blue = high freq)
+
+### Implementation Structure
+
+**Segment State Arrays** (22 values each, not 574):
+```javascript
+var NUM_ELECTRODES = 22
+var PIXELS_PER_ELECTRODE = floor(pixelCount / NUM_ELECTRODES)  // ~26 pixels
+
+var baseHues = array(NUM_ELECTRODES)            // Fixed rainbow hue per electrode (red=0, blue=0.67)
+var segmentValues = array(NUM_ELECTRODES)       // Brightness (min → triggered → min)
+var segmentSaturations = array(NUM_ELECTRODES)  // Only maxFreq segment desaturates (0=white, 1=color)
+var segmentDecayAge = array(NUM_ELECTRODES)     // Milliseconds since last trigger
+var segmentAmplitude = array(NUM_ELECTRODES)    // Controls segment size (0.0-1.0)
+
+var MIN_BRIGHTNESS = 0.05  // Minimum brightness for quiet segments
+
+// Initialize rainbow gradient
+for (i = 0; i < NUM_ELECTRODES; i++) {
+  baseHues[i] = 0.67 * i / (NUM_ELECTRODES - 1)  // Red (0) → Blue (21)
+  segmentValues[i] = MIN_BRIGHTNESS
+  segmentSaturations[i] = 1.0  // Full color
+}
+```
+
+**Logarithmic Frequency Bands** (like real cochlear implants):
+```javascript
+// Calculate logarithmically-spaced frequency bands
+var electrodeFreqBands = array(NUM_ELECTRODES + 1)  // 23 band edges for 22 bands
+
+function initializeFrequencyBands() {
+  var logMin = log2(SPEECH_MIN_FREQ)  // 200 Hz
+  var logMax = log2(SPEECH_MAX_FREQ)  // 8000 Hz
+  var logStep = (logMax - logMin) / NUM_ELECTRODES
+
+  for (i = 0; i <= NUM_ELECTRODES; i++) {
+    electrodeFreqBands[i] = pow(2, logMin + i * logStep)
+  }
+}
+```
+
+**Electrode Triggering**:
+```javascript
+function triggerElectrode(electrodeIndex, magnitude, isMaxFreq) {
+  // Brightness proportional to maxFrequencyMagnitude
+  var relativeMagnitude = magnitude / maxFrequencyMagnitude
+  segmentValues[electrodeIndex] = pow(relativeMagnitude, 2)
+
+  // Only maxFrequency segment turns white
+  if (isMaxFreq) {
+    segmentSaturations[electrodeIndex] = 0  // White
+  }
+  // Other segments keep their rainbow color (saturation = 1.0)
+
+  segmentDecayAge[electrodeIndex] = 0          // Reset decay timer
+  segmentAmplitude[electrodeIndex] = clamp(magnitude, 0, 1.0)  // Set segment size
+}
+```
+
+**Render Function** (amplitude-based spatial display):
+```javascript
+export function render(index) {
+  // Determine which electrode segment this pixel belongs to
+  var electrode = floor(index / PIXELS_PER_ELECTRODE)
+  var posInSegment = index - (electrode * PIXELS_PER_ELECTRODE)
+  var centerPixel = PIXELS_PER_ELECTRODE / 2
+  var distFromCenter = abs(posInSegment - centerPixel)
+
+  // Fixed rainbow hue for this electrode
+  var h = baseHues[electrode]
+  var s = segmentSaturations[electrode]
+  var v = segmentValues[electrode]
+
+  // Calculate how many pixels should be lit based on amplitude
+  var litRadius = segmentAmplitude[electrode] * (PIXELS_PER_ELECTRODE / 2)
+
+  if (distFromCenter <= litRadius) {
+    // Inside active region - full brightness with edge fade
+    var edgeFade = 1.0 - (distFromCenter / (litRadius + 1))
+    v = v * pow(edgeFade, 0.5)  // Gentle gradient
+  } else {
+    // Outside active region - minimum brightness (dim rainbow always visible)
+    v = MIN_BRIGHTNESS
+  }
+
+  hsv(h, s, v * v)  // Gamma correction
+}
+```
+
+**Decay Functions**:
+```javascript
+var DECAY_TIME = 3000  // 3 seconds
+var SATURATION_RECOVERY_TIME = 3000  // 3 seconds for white → color
+
+// No hue decay - hue is fixed per electrode (baseHues)
+
+function decayValue(age, startValue) {
+  // Fade from triggered brightness to minimum
+  if (age >= DECAY_TIME) return MIN_BRIGHTNESS
+  var normalized = age / DECAY_TIME
+  var decayed = startValue * pow(1 - normalized, 2)  // Exponential fade
+  return max(MIN_BRIGHTNESS, decayed)
+}
+
+function decaySaturation(currentSat, age) {
+  // Only applies to maxFrequency segment (others stay at 1.0)
+  if (currentSat >= 1.0) return 1.0  // Already full color
+  if (age >= SATURATION_RECOVERY_TIME) return 1.0
+  // Linear recovery: 0 (white) → 1 (rainbow color)
+  return age / SATURATION_RECOVERY_TIME
+}
+
+function decayAmplitude(age) {
+  // Amplitude decays faster - segment shrinks quickly
+  if (age >= DECAY_TIME * 0.3) return 0.0
+  var normalized = age / (DECAY_TIME * 0.3)
+  return max(0, 1.0 - pow(normalized, 1.5))  // Fast shrink
+}
+```
+
+### Tuning Parameters (User-Adjustable)
+
+```javascript
+export function sliderDecayTime(v) {
+  userDecayTime = 2.0 + v * 8.0  // 2-10 seconds
+  DECAY_TIME = userDecayTime * 1000
+}
+
+export function sliderSensitivity(v) {
+  userSensitivityMult = 0.1 + v * 1.9  // 0.1x - 2.0x
+}
+
+export function sliderDesatAmount(v) {
+  desaturationAmount = 0.05 + v * 0.45  // 0.05 - 0.5 per trigger
+}
+
+export function toggleSimulateAudio(bool) {
+  simulateAudio = bool  // Enable frequency sweep simulation
+}
+```
+
+### AGC System
+
+Uses PI controller aligned with `audio-lights.js`:
+- **No gainDiff** (derivative term removed for stability)
+- **Feedback**: Based on `pow(maxFrequencyMagnitude * sensitivity, 2)` like audio-lights.js
+- **Target**: Adjustable brightness target (0.3-0.5 recommended)
+- **Output clamped**: Between `minSensitivity` and `maxSensitivity`
+
+```javascript
+var maxSensitivity = 2500
+var minSensitivity = 5
+var brightness = 0.5  // Target brightness
+
+var pic = makePIController(0.05, 0.35, 30, 0, maxSensitivity)
+
+function calcPIController(pic, err) {
+  pic[2] = clamp(pic[2] + err, pic[3], pic[4])  // Integral accumulator
+  gainProportional = pic[0] * err
+  gainIntegral = pic[1] * pic[2]
+  return clamp(gainProportional + gainIntegral, minSensitivity, pic[4])
+}
+
+// In beforeRender:
+// Feedback based on scaled magnitude (like audio-lights.js)
+lastVal = pow(maxFrequencyMagnitude * sensitivity, 2)
+calcVal = lastVal
+sensitivity = calcPIController(pic, brightness - calcVal)
+```
+
+### File Location
+
+**`cochlear-implant.js`** - Implementation features:
+- 22-electrode segmented architecture
+- **Rainbow gradient base** (red=low freq, blue=high freq)
+- **Fixed hues per electrode** (no color rotation)
+- Logarithmic frequency band spacing (200-8000 Hz)
+- Amplitude-based spatial growth within segments
+- **Brightness proportional to maxFrequencyMagnitude**
+- **maxFrequency segment flashes white**, others brighten in their color
+- **Minimum brightness** for always-visible rainbow gradient
+- AGC aligned with audio-lights.js (no gainDiff)
+- Audio simulation for testing
+- UI controls for tuning
+
+---
+
+## Original Design Concept (For Reference)
+
+**Note**: The sections below describe the initial continuous spectrogram design (574 individual pixels). This approach was replaced with the 22-electrode segmented design during implementation based on user feedback.
+
 ## Project Overview
 
 Create an audio-reactive LED pattern for Pixelblaze that visualizes sound similar to how a cochlear implant processes audio. The pattern uses a persistence-of-vision approach where frequently-occurring frequencies accumulate color intensity, while infrequent sounds create colorful trails that fade over time.

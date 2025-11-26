@@ -78,6 +78,14 @@ export function showNumberSensitivity() {
   return dsensitivity
 }
 
+export function showNumberMinMFM() {
+  return minMFM
+}
+
+export function showNumberMaxMFM() {
+  return maxMFM
+}
+
 var pic = makePIController(0.05, .35, 30, 0, maxSensitivity)
 
 // Make a new PI Controller
@@ -100,6 +108,9 @@ function calcPIController(pic, err) {
 }
 
 export function beforeRender(delta) {
+  // Update breath timer for simulated breathing effect
+  breathTimer += delta
+
   // Here the PI controller is aiming for a sensitivity based on chasing recent
   // maxFrequencyMagnitudes to be 0.5
   // calcmean = vals.sum() / pixelCount
@@ -110,7 +121,7 @@ export function beforeRender(delta) {
   // To make the rays travel along the strip, sweep a position offset pointer
   // down the arrays of values and hues
   pos = (pos + speed * delta) % pixelCount
-  if (light == -1) simulateSound()  // No sensor board attached
+  if (light == -1) simulateSound()  // No sensor board - use breathing effect
   
   // The brightness value will be determined by the magnitude of the most
   // intense frequency. This is also our feedback to the PI controller.
@@ -169,9 +180,31 @@ export function render(index) {
   hsv(h, 1, vsq)
 }
 
+// Breathing effect parameters
+var breathDuration = 6000  // 6 seconds per breath cycle
+var breathTimer = 0
+
 function simulateSound() {
-  
-  maxFrequency += random(5000)
-  maxFrequencyMagnitude = .5
-  
+  // Slow breathing effect instead of random audio simulation
+  // breathProgress goes 0 → 1 over breathDuration
+  var breathProgress = (breathTimer % breathDuration) / breathDuration
+
+  // Smooth sine wave for breathing (0 at start/end, 1 at peak)
+  // sin gives -1 to 1, we shift to 0 to 1
+  var breathIntensity = (sin(breathProgress * PI2) + 1) / 2
+
+  // Gentle variation in "frequency" for subtle color shifts
+  maxFrequency = 1000 + breathIntensity * 500  // Calm blue-cyan range
+
+  // Brightness follows the breath
+  maxFrequencyMagnitude = 0.02 + breathIntensity * 0.06  // Gentle range matching real MFM values
 }
+
+export function sliderBreathDuration(v) {
+  breathDuration = 3000 + v * 9000  // 3-12 seconds
+}
+
+export function showNumberBreathSec() {
+  return breathDuration / 1000
+}
+
