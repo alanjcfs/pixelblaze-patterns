@@ -45,6 +45,9 @@ var segmentAmplitude = array(NUM_ELECTRODES)    // 0.0-1.0 (controls segment siz
 // Track which electrode is currently white (only one at a time)
 var currentWhiteElectrode = -1
 
+// Rainbow rotation offset (0.0-1.0, wraps around)
+var hueOffset = 0
+
 // Initialize rainbow gradient (red=low freq, blue=high freq)
 for (i = 0; i < NUM_ELECTRODES; i++) {
   baseHues[i] = 0.67 * i / (NUM_ELECTRODES - 1)  // Red (0) → Blue (21)
@@ -95,19 +98,18 @@ export var light = -1  // Ambient light sensor (-1 = no sensor board)
 export var frequencyData  // 32-element array of frequency magnitudes
 export var maxFrequencyMagnitude
 export var maxFrequency
-export var accelerometer  // 3-element array [x, y, z]
+export var energyAverage  // Average energy across all frequency bins
 
 // Sensitivity control (adjusted by AGC)
 export var sensitivity = 300
 
 // ============================================================================
-// MODE SWITCHING - Shake to toggle between modes
+// MODE SWITCHING
 // ============================================================================
 
 // Mode 0: Entire strip as one (574 pixels)
 // Mode 1: Split into three walls
 export var mode = 0
-var debounce = 0
 
 // Wall configuration (for split mode)
 var WALL1_START = 0
@@ -177,9 +179,29 @@ export function sliderSensitivity(v) {
   userSensitivityMult = 0.1 + v * 1.9
 }
 
+var colorRotationSpeed = 0  // Hue change per millisecond (0 = stopped)
+export function sliderColorRotation(v) {
+  if (v < 0.01) {
+    colorRotationSpeed = 0  // Stopped
+  } else {
+    // Map v from 0.01-1.0 to rotation period from 30s to 5s
+    var period = 30 - v * 25  // v=0.01→~30s, v=0.5→17.5s, v=1→5s
+    colorRotationSpeed = 1.0 / (period * 1000)  // Full hue cycle per period
+  }
+}
+
 var simulateAudio = false
 export function toggleSimulateAudio(bool) {
   simulateAudio = bool
+}
+
+export function toggleMode(bool) {
+  mode = bool ? 1 : 0  // false = 0 (entire strip), true = 1 (three walls)
+}
+
+var useEnergyAverage = false
+export function toggleUseEnergyAverage(bool) {
+  useEnergyAverage = bool  // false = maxFrequencyMagnitude, true = energyAverage
 }
 
 export function showNumberAvgBrightness() {
@@ -214,6 +236,11 @@ export function gaugeActiveElectrodes() {
 
 export function showNumberElectrodeCount() {
   return NUM_ELECTRODES
+}
+
+export function showNumberRotationPeriod() {
+  if (colorRotationSpeed == 0) return 0  // Stopped
+  return 1.0 / (colorRotationSpeed * 1000)  // Period in seconds
 }
 
 // ============================================================================
@@ -298,32 +325,19 @@ export function beforeRender(delta) {
   }
 
   // ============================================================================
-  // 1.5 MODE SWITCHING - Shake to toggle
+  // 1.5 RAINBOW COLOR ROTATION
   // ============================================================================
 
-  if (accelerometer) {
-    // 3D vector sum of x, y, and z acceleration
-    var totalAcceleration = sqrt(
-      accelerometer[0] * accelerometer[0] +
-      accelerometer[1] * accelerometer[1] +
-      accelerometer[2] * accelerometer[2]
-    )
-
-    debounce = clamp(debounce + delta, 0, 2000)  // Prevent overflow
-
-    // Cycle mode if sensor board is shaken, no more than 1x / sec
-    if (debounce > 1000 && totalAcceleration > 0.03) {
-      mode = (mode + 1) % 2  // Toggle between 0 and 1
-      debounce = 0
-    }
-  }
+  // Rotate rainbow colors across the strip
+  hueOffset = (hueOffset + delta * colorRotationSpeed) % 1.0
 
   // ============================================================================
   // 2. AUTOMATIC GAIN CONTROL (AGC) - aligned with audio-lights.js
   // ============================================================================
 
-  // Feedback based on scaled magnitude (like audio-lights.js)
-  lastVal = pow(maxFrequencyMagnitude * sensitivity, 2)
+  // Feedback based on either max frequency or average energy
+  var feedbackValue = useEnergyAverage ? energyAverage : maxFrequencyMagnitude
+  lastVal = pow(feedbackValue * sensitivity, 2)
   calcVal = lastVal
 
   // Run PI controller
@@ -442,8 +456,8 @@ export function render(index) {
   // Distance from center (in pixels)
   var distFromCenter = abs(posInSegment - centerPixel)
 
-  // Fixed rainbow hue for this electrode
-  var h = baseHues[electrode]
+  // Rainbow hue for this electrode (base hue + rotation offset)
+  var h = (baseHues[electrode] + hueOffset) % 1.0
   var s = segmentSaturations[electrode]
   var v = segmentValues[electrode]
 
@@ -494,6 +508,7 @@ function simulateSound() {
   }
 
   // Set bins near simulated frequency with varying magnitudes
+  var totalEnergy = 0
   for (i = 0; i < 32; i++) {
     var binFreq = i * 312.5
     var distFromMax = abs(binFreq - simFreq)
@@ -501,8 +516,12 @@ function simulateSound() {
       // Magnitude falls off with distance from max frequency
       var falloff = 1.0 - (distFromMax / 500)
       frequencyData[i] = simMagnitude * falloff
+      totalEnergy += frequencyData[i]
     } else {
       frequencyData[i] = 0
     }
   }
+
+  // Calculate average energy (simulate sensor board behavior)
+  energyAverage = totalEnergy / 32
 }
