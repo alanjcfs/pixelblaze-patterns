@@ -25,7 +25,7 @@ var PIXELS_PER_ELECTRODE = floor(pixelCount / NUM_ELECTRODES)  // ~26 pixels
 
 var DECAY_TIME = 5000  // Milliseconds for brightness decay
 var SATURATION_RECOVERY_TIME = 250  // Ms for white → rainbow color (fast recovery)
-var MIN_BRIGHTNESS = 0.20  // Minimum brightness for quiet segments (always visible)
+var MIN_BRIGHTNESS = 0.25  // Minimum brightness for quiet segments (always visible)
 
 // Frequency range for speech (cochlear implant typical range)
 var SPEECH_MIN_FREQ = 200   // Hz - lowest frequency
@@ -101,7 +101,8 @@ export var maxFrequency
 export var energyAverage  // Average energy across all frequency bins
 
 // Sensitivity control (adjusted by AGC)
-export var sensitivity = 300
+var agcSensitivity = 300  // Base sensitivity from AGC, before user multiplier
+export var sensitivity = 300  // agcSensitivity * userSensitivityMult, applied every frame
 
 // ============================================================================
 // MODE SWITCHING
@@ -216,7 +217,7 @@ export function showNumberAvgSaturation() {
   var count = 0
   var sum = 0
   for (i = 0; i < NUM_ELECTRODES; i++) {
-    if (segmentValues[i] > 0.1) {
+    if (segmentAmplitude[i] > 0.1) {
       sum += segmentSaturations[i]
       count++
     }
@@ -227,7 +228,7 @@ export function showNumberAvgSaturation() {
 export function gaugeActiveElectrodes() {
   var count = 0
   for (i = 0; i < NUM_ELECTRODES; i++) {
-    if (segmentValues[i] > 0.1) {
+    if (segmentAmplitude[i] > 0.1) {
       count++
     }
   }
@@ -340,8 +341,16 @@ export function beforeRender(delta) {
   lastVal = pow(feedbackValue * sensitivity, 2)
   calcVal = lastVal
 
-  // Run PI controller
-  sensitivity = calcPIController(pic, brightness - calcVal) * userSensitivityMult
+  // Run PI controller only when there's actual audio content
+  // This prevents AGC from boosting sensitivity in quiet/silent environments
+  // Threshold based on measured energyAverage during conversation (~0.0005-0.001)
+  if (feedbackValue > 0.0003) {  // Threshold for meaningful audio
+    agcSensitivity = calcPIController(pic, brightness - calcVal)
+  }
+
+  // Apply the user's multiplier every frame, independent of the AGC gate above,
+  // so the slider still has an effect when there's no audio to trigger AGC
+  sensitivity = agcSensitivity * userSensitivityMult
 
   // Update UI gauges
   timer += delta
