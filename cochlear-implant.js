@@ -288,6 +288,9 @@ function decayValue(age, startValue) {
   if (age >= DECAY_TIME) return MIN_BRIGHTNESS
   var normalized = age / DECAY_TIME
   var decayed = startValue * pow(1 - normalized, 0.8)  // Slower fade
+  // Decaying from a peak should never end up brighter than that peak -
+  // don't trust pow() not to violate that if given a fractional exponent
+  if (decayed > startValue) decayed = startValue
   return max(MIN_BRIGHTNESS, decayed)
 }
 
@@ -408,6 +411,14 @@ export function beforeRender(delta) {
   for (i = 0; i < NUM_ELECTRODES; i++) {
     // Increment decay age
     segmentDecayAge[i] += delta
+
+    // Age has no reason to grow past DECAY_TIME - "fully decayed" is fully
+    // decayed. Without this cap it climbs forever for any electrode that
+    // goes a while without retriggering, until it overflows Pixelblaze's
+    // 16.16 fixed-point range (+/-32,768) and wraps to a large negative
+    // number, which then evades the decay functions' "age >= ..." guards
+    // and feeds garbage into pow(). Confirmed live in cochlear-implant-continuum.js.
+    if (segmentDecayAge[i] > DECAY_TIME) segmentDecayAge[i] = DECAY_TIME
 
     // Update values (no hue decay - hue is fixed)
     segmentValues[i] = decayValue(segmentDecayAge[i], triggeredValues[i])

@@ -12,6 +12,14 @@
   continuous strip (no wall-splitting mode), just blockier than the
   per-pixel version - trading resolution for a much cheaper beforeRender.
 
+  Sensitivity is fixed (BASE_SENSITIVITY * slider), not auto-adjusted. This
+  pattern used to have an AGC (PI controller) that normalized brightness to
+  a constant target regardless of room volume - which meant a silent room
+  would eventually get amplified until it looked just as bright as a loud
+  one. That's the opposite of what this pattern is for: a quiet room should
+  read dim, a loud room should read bright. Fixed sensitivity, calibrated
+  by hand, preserves that distinction instead of erasing it.
+
   Visual effect:
   - Silence: Dim rainbow gradient always visible (red=low freq -> blue=high freq)
   - Section nearest maxFrequency: Flashes white, fades back to rainbow color
@@ -40,7 +48,7 @@ var MIN_BRIGHTNESS = 0.25  // Minimum brightness for quiet sections (always visi
 // PER-SECTION STATE ARRAYS (one value per section, not per pixel)
 // ============================================================================
 
-var sectionValues = array(NUM_SECTIONS)       // 0.0-1.0 (brightness)
+export var sectionValues = array(NUM_SECTIONS)  // 0.0-1.0 (brightness) - exported for live debugging
 var sectionSaturations = array(NUM_SECTIONS)  // 0.0-1.0 (1.0=rainbow color, 0.0=white)
 var sectionDecayAge = array(NUM_SECTIONS)     // Milliseconds since last trigger
 var sectionTriggered = array(NUM_SECTIONS)    // Peak brightness a section decays from
@@ -70,49 +78,15 @@ export var maxFrequencyMagnitude
 export var maxFrequency
 export var energyAverage  // Average energy across all frequency bins
 
-// Sensitivity control (adjusted by AGC)
-var agcSensitivity = 300  // Base sensitivity from AGC, before user multiplier
-export var sensitivity = 300  // agcSensitivity * userSensitivityMult, applied every frame
+// Sensitivity control - fixed, manually calibrated (no AGC).
+// AGC was removed: it auto-normalizes to a constant target brightness
+// regardless of how loud the room actually is, which fights the goal of a
+// quiet room reading dim and a loud room reading bright. A fixed sensitivity
+// lets brightness track actual loudness instead of erasing that difference.
+var BASE_SENSITIVITY = 300  // Calibrate this against your room
+export var sensitivity = 300  // BASE_SENSITIVITY * userSensitivityMult
 
-// ============================================================================
-// AUTOMATIC GAIN CONTROL (AGC) - PI Controller (aligned with audio-lights.js)
-// ============================================================================
-
-var maxSensitivity = 2500
-var minSensitivity = 5  // Minimum output to ensure some visible light
-var brightness = 0.5  // Target brightness
-
-var pic = makePIController(0.05, 0.35, 30, 0, maxSensitivity)
-
-export var lastVal = 0.25
-var calcVal = 0
-
-// UI monitoring
-var timer = 0
-var waitTime = 1000
-export var displayedSensitivity = 0
-var undershoot = 0
-var overshoot = 0
-
-function makePIController(kp, ki, start, min, max) {
-  var pic = array(5)
-  pic[0] = kp
-  pic[1] = ki
-  pic[2] = start
-  pic[3] = min
-  pic[4] = max
-  return pic
-}
-
-export var gainProportional = 0
-export var gainIntegral = 0
-
-function calcPIController(pic, err) {
-  pic[2] = clamp(pic[2] + err, pic[3], pic[4])  // Integral accumulator
-  gainProportional = pic[0] * err
-  gainIntegral = pic[1] * pic[2]
-  return clamp(gainProportional + gainIntegral, minSensitivity, pic[4])
-}
+var calcVal = 0  // Diagnostic readout only - no longer drives sensitivity
 
 // ============================================================================
 // USER INTERFACE CONTROLS
@@ -128,6 +102,7 @@ export function sliderDecayTime(v) {
 var userSensitivityMult = 1.0
 export function sliderSensitivity(v) {
   userSensitivityMult = 0.1 + v * 1.9
+  sensitivity = BASE_SENSITIVITY * userSensitivityMult
 }
 
 var colorRotationSpeed = 0  // Hue change per millisecond (0 = stopped)
@@ -156,7 +131,7 @@ export function showNumberAvgBrightness() {
 }
 
 export function showNumberSensitivity() {
-  return displayedSensitivity
+  return sensitivity
 }
 
 // "Active" = still within the loud/decaying phase of its envelope, not just
@@ -225,50 +200,45 @@ export function beforeRender(delta) {
   hueOffset = (hueOffset + delta * colorRotationSpeed) % 1.0
 
   // ============================================================================
-  // 2. AUTOMATIC GAIN CONTROL (AGC) - aligned with audio-lights.js
+  // 2. LOUDNESS READOUT (diagnostic only - sensitivity is fixed, see above)
   // ============================================================================
 
-  // Feedback based on either max frequency or average energy
   var feedbackValue = useEnergyAverage ? energyAverage : maxFrequencyMagnitude
-  lastVal = pow(feedbackValue * sensitivity, 2)
-  calcVal = lastVal
-
-  // Run PI controller only when there's actual audio content
-  // This prevents AGC from boosting sensitivity in quiet/silent environments
-  // Threshold based on measured energyAverage during conversation (~0.0005-0.001)
-  if (feedbackValue > 0.0003) {  // Threshold for meaningful audio
-    agcSensitivity = calcPIController(pic, brightness - calcVal)
-  }
-
-  // Apply the user's multiplier every frame, independent of the AGC gate above,
-  // so the slider still has an effect when there's no audio to trigger AGC
-  sensitivity = agcSensitivity * userSensitivityMult
-
-  // Update UI gauges
-  timer += delta
-  if (timer > waitTime) {
-    timer -= waitTime
-    undershoot = brightness - calcVal
-    overshoot = calcVal - brightness
-    displayedSensitivity = sensitivity
-  }
+  calcVal = pow(feedbackValue * sensitivity, 2)
 
   // ============================================================================
   // 3. PER-SECTION TRIGGERING & DECAY - direct bin-to-section mapping
   // ============================================================================
 
   var maxFreqSection = round(maxFrequency / BIN_HZ)
-  maxFreqSection = clamp(maxFreqSection, 0, NUM_SECTIONS - 1)
+  if (maxFreqSection < 0) maxFreqSection = 0
+  if (maxFreqSection > NUM_SECTIONS - 1) maxFreqSection = NUM_SECTIONS - 1
 
   for (i = 0; i < NUM_SECTIONS; i++) {
     sectionDecayAge[i] += delta
+
+    // Age has no reason to grow past DECAY_TIME - "fully decayed" is fully
+    // decayed. Without this cap it climbs forever for any section that goes
+    // a while without retriggering, until it overflows Pixelblaze's 16.16
+    // fixed-point range (+/-32,768) and wraps to a large negative number,
+    // which then evades the ">= DECAY_TIME" check below and feeds a garbage
+    // "base" into pow(). Confirmed live via diagnostic instrumentation.
+    if (sectionDecayAge[i] > DECAY_TIME) sectionDecayAge[i] = DECAY_TIME
 
     var triggered = false
 
     if (frequencyData) {
       var rawMag = frequencyData[i]  // Direct bin lookup - no interpolation needed
       var scaledMag = rawMag * sensitivity
-      var newValue = clamp(scaledMag, MIN_BRIGHTNESS, 1.0)
+
+      // Explicit bounds check, not clamp() - live testing showed sectionValues
+      // exceeding 1.0 (up to 2.46 observed) even with clamp(scaledMag, MIN_BRIGHTNESS,
+      // 1.0) here, which then reads as "stuck at 100%" since a value >1.0 still
+      // renders as fully-on and takes extra time decaying back under 1.0 before
+      // any dimming is even visible
+      var newValue = scaledMag
+      if (newValue < MIN_BRIGHTNESS) newValue = MIN_BRIGHTNESS
+      if (newValue > 1.0) newValue = 1.0
 
       // Trigger threshold, and only if it beats the current (still-decaying) value
       if (scaledMag > 0.15 && newValue > sectionValues[i]) {
@@ -286,6 +256,9 @@ export function beforeRender(delta) {
       } else {
         var normalized = sectionDecayAge[i] / DECAY_TIME
         var decayed = sectionTriggered[i] * pow(1 - normalized, 0.8)
+        // Decaying from a peak should never end up brighter than that peak -
+        // don't trust pow() not to violate that if given a fractional exponent
+        if (decayed > sectionTriggered[i]) decayed = sectionTriggered[i]
         sectionValues[i] = max(MIN_BRIGHTNESS, decayed)
       }
     }
@@ -340,7 +313,8 @@ function simulateSound() {
   simTime += 16
 
   var sweepPeriod = 10000
-  var sweepProgress = (simTime % sweepPeriod) / sweepPeriod
+  simTime = simTime % sweepPeriod  // same unbounded-accumulator risk as sectionDecayAge
+  var sweepProgress = simTime / sweepPeriod
 
   // Sweep across the full bin range so all 32 sections light up
   var simFreq = sweepProgress * (NUM_SECTIONS - 1) * BIN_HZ
