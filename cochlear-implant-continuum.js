@@ -1,22 +1,23 @@
 /*
-  Cochlear Implant - Per-Pixel Frequency Continuum
+  Cochlear Implant - 32 Sections (matches sensor board bins directly)
 
-  Same concept as cochlear-implant.js, but instead of grouping the strip into
-  22 electrode segments, each of the 574 pixels is its own frequency slot,
-  log-spaced across the speech range (200-8000 Hz). The whole strip is one
-  continuous spectrum - no wall-splitting mode.
+  Earlier version of this file mapped each of the 574 pixels to its own
+  log-spaced frequency and interpolated between the sensor board's 32 raw
+  bins to fill in the gaps. That was expensive (574 interpolations/frame)
+  and dropped fps well below cochlear-implant.js's 22-electrode design.
 
-  The sensor board only reports 32 frequency bins, so each pixel's magnitude
-  is linearly interpolated between its two nearest bins. That's what turns
-  32 discrete samples into a smooth 574-pixel continuum instead of 32 blocky
-  steps.
+  This version instead uses exactly 32 sections - one per raw frequencyData
+  bin, no interpolation, no log-frequency mapping, no speech-range
+  filtering. Each section is just frequencyData[i] directly. Still one
+  continuous strip (no wall-splitting mode), just blockier than the
+  per-pixel version - trading resolution for a much cheaper beforeRender.
 
   Visual effect:
   - Silence: Dim rainbow gradient always visible (red=low freq -> blue=high freq)
-  - Pixel nearest maxFrequency: Flashes white, fades back to rainbow color
-  - Other pixels: Brighten in their own rainbow color, proportional to
-    interpolated frequencyData at that pixel's frequency
-  - Brightness decays smoothly per pixel after a peak, same envelope as
+  - Section nearest maxFrequency: Flashes white, fades back to rainbow color
+  - Other sections: Brighten in their own rainbow color, proportional to
+    that bin's raw magnitude
+  - Brightness decays smoothly per section after a peak, same envelope as
     cochlear-implant.js
 
   Designed for 574-pixel LED strip with sensor expansion board.
@@ -26,70 +27,38 @@
 // CONFIGURATION
 // ============================================================================
 
+var NUM_SECTIONS = 32  // Matches the sensor board's 32 frequency bins exactly
+var PIXELS_PER_SECTION = floor(pixelCount / NUM_SECTIONS)  // ~17 pixels
+
+var BIN_HZ = 312.5  // Approximate Hz per frequencyData bin
+
 var DECAY_TIME = 5000  // Milliseconds for brightness decay
 var SATURATION_RECOVERY_TIME = 250  // Ms for white → rainbow color (fast recovery)
-var MIN_BRIGHTNESS = 0.25  // Minimum brightness for quiet pixels (always visible)
-
-// Frequency range for speech (cochlear implant typical range)
-var SPEECH_MIN_FREQ = 200   // Hz - lowest frequency
-var SPEECH_MAX_FREQ = 8000  // Hz - highest frequency
+var MIN_BRIGHTNESS = 0.25  // Minimum brightness for quiet sections (always visible)
 
 // ============================================================================
-// PER-PIXEL STATE ARRAYS (one value per pixel - this is the whole point)
+// PER-SECTION STATE ARRAYS (one value per section, not per pixel)
 // ============================================================================
 
-var pixelValues = array(pixelCount)       // 0.0-1.0 (displayed brightness)
-var pixelSaturations = array(pixelCount)  // 0.0-1.0 (1.0=rainbow color, 0.0=white)
-var pixelDecayAge = array(pixelCount)     // Milliseconds since last trigger
-var pixelTriggered = array(pixelCount)    // Peak brightness a pixel decays from
+var sectionValues = array(NUM_SECTIONS)       // 0.0-1.0 (brightness)
+var sectionSaturations = array(NUM_SECTIONS)  // 0.0-1.0 (1.0=rainbow color, 0.0=white)
+var sectionDecayAge = array(NUM_SECTIONS)     // Milliseconds since last trigger
+var sectionTriggered = array(NUM_SECTIONS)    // Peak brightness a section decays from
 
-// Track which pixel is currently white (only one at a time) so saturation
-// recovery only has to touch that one pixel instead of scanning all 574
-var currentWhitePixel = -1
-var whitePixelAge = 0
+// Track which section is currently white (only one at a time) so saturation
+// recovery only has to touch that one section instead of scanning all 32
+var currentWhiteSection = -1
+var whiteSectionAge = 0
 
 // Rainbow rotation offset (0.0-1.0, wraps around)
 var hueOffset = 0
 
-for (i = 0; i < pixelCount; i++) {
-  pixelValues[i] = MIN_BRIGHTNESS   // Dim but visible
-  pixelSaturations[i] = 1.0         // Full rainbow color
-  pixelDecayAge[i] = DECAY_TIME * 2 // Fully decayed
-  pixelTriggered[i] = MIN_BRIGHTNESS
+for (i = 0; i < NUM_SECTIONS; i++) {
+  sectionValues[i] = MIN_BRIGHTNESS   // Dim but visible
+  sectionSaturations[i] = 1.0         // Full rainbow color
+  sectionDecayAge[i] = DECAY_TIME * 2 // Fully decayed
+  sectionTriggered[i] = MIN_BRIGHTNESS
 }
-
-// ============================================================================
-// FREQUENCY MAPPING - Logarithmic (like real cochlear implants)
-// ============================================================================
-
-// Each pixel gets its own log-spaced target frequency, precomputed once.
-// Real cochlear implants use log spacing because human hearing is logarithmic.
-var LOG_MIN_FREQ = log2(SPEECH_MIN_FREQ)
-var LOG_MAX_FREQ = log2(SPEECH_MAX_FREQ)
-var LOG_STEP = (LOG_MAX_FREQ - LOG_MIN_FREQ) / (pixelCount - 1)
-
-var pixelFreq = array(pixelCount)  // Target frequency for each pixel
-
-function initializeFrequencyMap() {
-  for (i = 0; i < pixelCount; i++) {
-    pixelFreq[i] = pow(2, LOG_MIN_FREQ + i * LOG_STEP)
-  }
-}
-initializeFrequencyMap()
-
-// Invert the log mapping to find which pixel a given frequency belongs to
-// (used to locate the maxFrequency pixel for the white-flash accent)
-function freqToPixelIndex(freq) {
-  freq = clamp(freq, SPEECH_MIN_FREQ, SPEECH_MAX_FREQ)
-  var idx = round((log2(freq) - LOG_MIN_FREQ) / LOG_STEP)
-  return clamp(idx, 0, pixelCount - 1)
-}
-
-// The sensor board reports 32 bins at ~312.5 Hz apart. Each pixel's magnitude
-// is linearly interpolated between its two nearest bins (inlined into the
-// per-pixel loop in beforeRender - pixelFreq[i] is always within
-// [SPEECH_MIN_FREQ, SPEECH_MAX_FREQ], so binHigh never exceeds bin 25).
-var BIN_HZ = 312.5
 
 // ============================================================================
 // AUDIO PROCESSING - Sensor Board Variables
@@ -196,26 +165,26 @@ export function showNumberAvgSaturation() {
   var count = 0
   var sum = 0
   var activeWindow = DECAY_TIME * 0.3
-  for (i = 0; i < pixelCount; i++) {
-    if (pixelDecayAge[i] < activeWindow) {
-      sum += pixelSaturations[i]
+  for (i = 0; i < NUM_SECTIONS; i++) {
+    if (sectionDecayAge[i] < activeWindow) {
+      sum += sectionSaturations[i]
       count++
     }
   }
   return count > 0 ? sum / count : 1.0
 }
 
-export function gaugeActivePixels() {
+export function gaugeActiveSections() {
   var count = 0
   var activeWindow = DECAY_TIME * 0.3
-  for (i = 0; i < pixelCount; i++) {
-    if (pixelDecayAge[i] < activeWindow) count++
+  for (i = 0; i < NUM_SECTIONS; i++) {
+    if (sectionDecayAge[i] < activeWindow) count++
   }
-  return count / pixelCount
+  return count / NUM_SECTIONS
 }
 
 export function showNumberChannelCount() {
-  return pixelCount
+  return NUM_SECTIONS
 }
 
 export function showNumberRotationPeriod() {
@@ -228,7 +197,7 @@ export function showNumberRotationPeriod() {
 // ============================================================================
 
 function decaySaturation(currentSat, age) {
-  // Only applies to the maxFrequency pixel (others stay at 1.0)
+  // Only applies to the maxFrequency section (others stay at 1.0)
   if (currentSat >= 1.0) return 1.0  // Already full color
   if (age >= SATURATION_RECOVERY_TIME) return 1.0
   // Linear recovery: 0 (white) → 1 (rainbow color)
@@ -285,64 +254,59 @@ export function beforeRender(delta) {
   }
 
   // ============================================================================
-  // 3. PER-PIXEL FREQUENCY MAPPING, TRIGGERING & DECAY
+  // 3. PER-SECTION TRIGGERING & DECAY - direct bin-to-section mapping
   // ============================================================================
 
-  var maxFreqPixel = freqToPixelIndex(maxFrequency)
+  var maxFreqSection = round(maxFrequency / BIN_HZ)
+  maxFreqSection = clamp(maxFreqSection, 0, NUM_SECTIONS - 1)
 
-  for (i = 0; i < pixelCount; i++) {
-    pixelDecayAge[i] += delta
+  for (i = 0; i < NUM_SECTIONS; i++) {
+    sectionDecayAge[i] += delta
 
     var triggered = false
 
     if (frequencyData) {
-      // Interpolate this pixel's magnitude between its two nearest bins
-      // (inlined - a function call here costs more than the math itself)
-      var binPos = pixelFreq[i] / BIN_HZ
-      var binLow = floor(binPos)
-      var weight = binPos - binLow
-      var rawMag = mix(frequencyData[binLow], frequencyData[binLow + 1], weight)
+      var rawMag = frequencyData[i]  // Direct bin lookup - no interpolation needed
       var scaledMag = rawMag * sensitivity
       var newValue = clamp(scaledMag, MIN_BRIGHTNESS, 1.0)
 
       // Trigger threshold, and only if it beats the current (still-decaying) value
-      if (scaledMag > 0.15 && newValue > pixelValues[i]) {
-        pixelValues[i] = newValue
-        pixelTriggered[i] = newValue
-        pixelDecayAge[i] = 0
+      if (scaledMag > 0.15 && newValue > sectionValues[i]) {
+        sectionValues[i] = newValue
+        sectionTriggered[i] = newValue
+        sectionDecayAge[i] = 0
         triggered = true
       }
     }
 
     if (!triggered) {
-      // Inlined decay curve, with a fast path for the common fully-decayed
-      // case so most pixels skip straight past the pow() call entirely
-      if (pixelDecayAge[i] >= DECAY_TIME) {
-        pixelValues[i] = MIN_BRIGHTNESS
+      // Fast path for the common fully-decayed case skips the pow() call
+      if (sectionDecayAge[i] >= DECAY_TIME) {
+        sectionValues[i] = MIN_BRIGHTNESS
       } else {
-        var normalized = pixelDecayAge[i] / DECAY_TIME
-        var decayed = pixelTriggered[i] * pow(1 - normalized, 0.8)
-        pixelValues[i] = max(MIN_BRIGHTNESS, decayed)
+        var normalized = sectionDecayAge[i] / DECAY_TIME
+        var decayed = sectionTriggered[i] * pow(1 - normalized, 0.8)
+        sectionValues[i] = max(MIN_BRIGHTNESS, decayed)
       }
     }
 
-    // Only the maxFrequency pixel turns white (and only one at a time)
-    if (triggered && i == maxFreqPixel) {
-      if (currentWhitePixel >= 0 && currentWhitePixel != i) {
-        pixelSaturations[currentWhitePixel] = 1.0
+    // Only the maxFrequency section turns white (and only one at a time)
+    if (triggered && i == maxFreqSection) {
+      if (currentWhiteSection >= 0 && currentWhiteSection != i) {
+        sectionSaturations[currentWhiteSection] = 1.0
       }
-      pixelSaturations[i] = 0  // White
-      currentWhitePixel = i
-      whitePixelAge = 0
+      sectionSaturations[i] = 0  // White
+      currentWhiteSection = i
+      whiteSectionAge = 0
     }
   }
 
-  // Saturation only ever differs from 1.0 for the one recovering white pixel,
-  // so recover just that one instead of scanning decaySaturation over all 574
-  if (currentWhitePixel >= 0) {
-    whitePixelAge += delta
-    pixelSaturations[currentWhitePixel] = decaySaturation(pixelSaturations[currentWhitePixel], whitePixelAge)
-    if (pixelSaturations[currentWhitePixel] >= 1.0) currentWhitePixel = -1
+  // Saturation only ever differs from 1.0 for the one recovering white section,
+  // so recover just that one instead of scanning decaySaturation over all 32
+  if (currentWhiteSection >= 0) {
+    whiteSectionAge += delta
+    sectionSaturations[currentWhiteSection] = decaySaturation(sectionSaturations[currentWhiteSection], whiteSectionAge)
+    if (sectionSaturations[currentWhiteSection] >= 1.0) currentWhiteSection = -1
   }
 }
 
@@ -351,10 +315,13 @@ export function beforeRender(delta) {
 // ============================================================================
 
 export function render(index) {
-  // Rainbow hue for this pixel (red=low freq → blue=high freq, plus rotation)
-  var h = (0.67 * index / (pixelCount - 1) + hueOffset) % 1.0
-  var s = pixelSaturations[index]
-  var v = pixelValues[index]
+  var section = floor(index / PIXELS_PER_SECTION)
+  if (section >= NUM_SECTIONS) section = NUM_SECTIONS - 1
+
+  // Rainbow hue for this section (red=low freq → blue=high freq, plus rotation)
+  var h = (0.67 * section / (NUM_SECTIONS - 1) + hueOffset) % 1.0
+  var s = sectionSaturations[section]
+  var v = sectionValues[section]
 
   // Apply gamma correction
   var vGamma = v * v
@@ -375,8 +342,8 @@ function simulateSound() {
   var sweepPeriod = 10000
   var sweepProgress = (simTime % sweepPeriod) / sweepPeriod
 
-  // Sweep through frequency range
-  var simFreq = SPEECH_MIN_FREQ + sweepProgress * (SPEECH_MAX_FREQ - SPEECH_MIN_FREQ)
+  // Sweep across the full bin range so all 32 sections light up
+  var simFreq = sweepProgress * (NUM_SECTIONS - 1) * BIN_HZ
 
   // Varying amplitude - realistic range based on sensor board (0.01-0.1)
   var simMagnitude = 0.02 + 0.06 * wave(sweepProgress)
@@ -391,7 +358,7 @@ function simulateSound() {
   // Set bins near simulated frequency with varying magnitudes
   var totalEnergy = 0
   for (i = 0; i < 32; i++) {
-    var binFreq = i * 312.5
+    var binFreq = i * BIN_HZ
     var distFromMax = abs(binFreq - simFreq)
     if (distFromMax < 500) {
       // Magnitude falls off with distance from max frequency
